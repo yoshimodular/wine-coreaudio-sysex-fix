@@ -62,7 +62,7 @@ var buf = Data()
 var packets = 0
 let lock = NSLock()
 
-func report() {
+func report(_ buf: Data, _ packets: Int) {
     var complete = 0, truncated = 0, maxLen = 0, cur = 0, open = false
     for b in buf {
         if b == 0xF0 {
@@ -95,10 +95,17 @@ let handler: MIDIReadBlock = { pl, _ in
     lock.unlock()
 }
 
+// Copy under the lock and write outside it: holding it across two writes to
+// disk blocks the CoreMIDI callback every half second, which is exactly what
+// note 2 at the top of this file says must be avoided.
 let writer = Thread {
     while true {
         Thread.sleep(forTimeInterval: 0.5)
-        lock.lock(); report(); lock.unlock()
+        lock.lock()
+        let copy = buf
+        let np = packets
+        lock.unlock()
+        report(copy, np)
     }
 }
 writer.stackSize = 512 * 1024

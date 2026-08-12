@@ -141,7 +141,7 @@ Tunable through environment variables:
 | `WINMM_DELAY` | 160 | ms between chunks (160 → ~2500 B/s) |
 | `WINMM_LOG` | unset | path to a log file; unset means no logging |
 
-### Three implementation details that are not obvious
+### Four implementation details that are not obvious
 
 These cost real debugging time and are the reason the proxy is not a ten-line
 wrapper.
@@ -149,20 +149,38 @@ wrapper.
 1. **You cannot open a second handle to the same device.** The natural design —
    open a private handle, chunk on it, leave the application's handle alone —
    does not work: Wine returns `MMSYSERR_ALLOCATED` on a second `midiOutOpen` to
-   the same device. So the chunking **reuses the application's own `MIDIHDR`**,
-   saving and restoring `lpData` / `dwBufferLength` / `dwBytesRecorded` and
-   clearing `MHDR_DONE` / `MHDR_INQUEUE` between chunks. That way every pointer
-   handed back to the application is its own and is still valid when it gets it.
+   the same device. The chunks therefore have to go out on the application's own
+   handle.
 
-2. **The callback is intercepted so the application sees one `MOM_DONE`, not
-   N.** An application that sends one buffer expects exactly one completion
-   notification. `midiOutOpen` therefore substitutes its own callback when the
-   application asked for `CALLBACK_FUNCTION`, and swallows the `MOM_DONE` of
-   every intermediate chunk, passing through only the last one. (Wine services
-   `MOM_DONE` synchronously within the `midiOutLongMsg` call, so a single flag is
-   enough.)
+2. **The application's `MIDIHDR` is never touched.** The chunks are sent with a
+   header of the proxy's own, one per handle, allocated on first use and freed
+   on close. Reusing the application's — mutating its `lpData` /
+   `dwBufferLength` / `dwBytesRecorded` for each chunk — corrupts the heap: Wine
+   services `MOM_DONE` *synchronously* inside `midiOutLongMsg`, so the
+   application's completion handler runs while its own header still points into
+   the middle of the buffer, and an ordinary handler (`unprepare();
+   free(hdr->lpData);`) then frees a pointer 15 KB into the allocation.
 
-3. **Wine fires `MOM_OPEN` *during* the `midiOutOpen` call itself.** If the
+3. **The callback is intercepted so that a `CALLBACK_FUNCTION` application sees
+   one `MOM_DONE`, not N.** An application that sends one buffer expects exactly
+   one completion notification. `midiOutOpen` therefore substitutes its own
+   callback when the application asked for `CALLBACK_FUNCTION`; the notification
+   of every chunk is swallowed, and once the whole buffer is out the proxy
+   emits a single `MOM_DONE` itself, with the application's header intact.
+
+   **This filtering only works for `CALLBACK_FUNCTION`.** With
+   `CALLBACK_WINDOW`, `CALLBACK_EVENT` and `CALLBACK_THREAD` the driver posts
+   the notification directly to the window, event or thread, and there is no way
+   to intercept it from outside winmm — so such an application receives one
+   notification per chunk. They are at least harmless: they carry the *proxy's*
+   header, not the application's, so the application never sees its own header
+   in a bogus state; and after the last chunk the proxy delivers one final
+   notification carrying the real header, via `PostMessageA` /
+   `PostThreadMessageA` / `SetEvent`. An application of this kind that expects
+   exactly one `MM_MOM_DONE` per send may still behave oddly on large dumps.
+   This is a known limitation, and the first place to look.
+
+4. **Wine fires `MOM_OPEN` *during* the `midiOutOpen` call itself.** If the
    handle-table slot is filled in *after* `midiOutOpen` returns, that callback
    runs against a half-written slot — or, worse, against the callback pointer of
    a previous handle, if closing had only cleared the handle field. The slot must

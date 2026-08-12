@@ -114,16 +114,32 @@ interface).
 Details that were hard to find:
 
 1. **You cannot open a second handle to the same device** — Wine returns
-   `MMSYSERR_ALLOCATED`. That is why the chunking **reuses the application's own
-   `MIDIHDR`**, saving and restoring `lpData`/`dwBufferLength` and clearing
-   `MHDR_DONE`/`MHDR_INQUEUE` between chunks: that way every pointer that comes
-   back to it is its own and is still valid.
+   `MMSYSERR_ALLOCATED`. So the obvious design — a private handle to chunk on,
+   with the application's own handle left completely alone — is not available:
+   the chunks have to go out on the application's handle.
 
-2. So that it does not receive one `MOM_DONE` per chunk, `midiOutOpen`
-   **substitutes the callback** when it is `CALLBACK_FUNCTION` and swallows the
-   intermediate ones.
+2. **The application's header is not touched.** The chunks are sent with a
+   `MIDIHDR` of our own, one per handle, reused and freed on close. Reusing the
+   application's, mutating its `lpData` and `dwBufferLength`, is dangerous: Wine
+   services `MOM_DONE` synchronously inside the call, so the notification of the
+   last chunk would reach it with the header pointing into the middle of the
+   block, and an ordinary handler (`unprepare` and `free(lpData)`) would free a
+   pointer 15 KB into the allocation.
 
-3. **Wine fires `MOM_OPEN` during the `midiOutOpen` call itself.** If the
+3. So that it receives **a single** completion notification, `midiOutOpen`
+   substitutes the callback when it is `CALLBACK_FUNCTION`, swallows the ones
+   belonging to the chunks, and when the send finishes one is emitted with the
+   application's header intact.
+
+   **Known limitation:** with `CALLBACK_WINDOW`, `CALLBACK_EVENT` or
+   `CALLBACK_THREAD` there is no way to filter the driver's notifications from
+   outside, so the application receives one per chunk. Those carry *our* header,
+   not its own — valid memory belonging to someone else, rather than its own in
+   a corrupted state — and at the end its own is delivered to it with
+   `PostMessage` / `PostThreadMessage` / `SetEvent`. If an application of that
+   kind misbehaves with large dumps, this is where to look.
+
+4. **Wine fires `MOM_OPEN` during the `midiOutOpen` call itself.** If the
    handle-table entry is filled in *after* opening, that callback runs with
    half-written data, or with the pointer of the previous handle if closing only
    cleared the handle field. The entry must be reserved and filled in

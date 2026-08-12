@@ -23,6 +23,17 @@ D="$(cd "$(dirname "$0")" && pwd)"
 B="$HOME/Library/Application Support/CrossOver/Bottles/$BOTTLE"
 CX="${CROSSOVER:-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver}"
 
+# Only this bottle's wineserver. `pkill -f wineserver` takes down every other
+# CrossOver application that happens to be open, without warning.
+# The `return 0` is not decoration: under `set -e` a final non-matching grep
+# would abort the script just before the closing instructions.
+kill_bottle_wineserver() {
+    for w in $(pgrep -x wineserver 2>/dev/null); do
+        lsof -p "$w" 2>/dev/null | grep -qF "Bottles/$BOTTLE/" && kill "$w" 2>/dev/null
+    done
+    return 0
+}
+
 [ -d "$B" ] || { echo "Bottle \"$BOTTLE\" does not exist."; \
                  ls "$HOME/Library/Application Support/CrossOver/Bottles/"; exit 1; }
 
@@ -70,7 +81,7 @@ cp "$D/wmiditest.exe"                    "$B/drive_c/"
 # that does not find the native DLL ends up with no winmm at all.
 "$CX/bin/wine" --bottle "$BOTTLE" --wl-app reg add \
     'HKCU\Software\Wine\DllOverrides' /v winmm /t REG_SZ /d 'native,builtin' /f >/dev/null 2>&1
-sleep 2; pkill -f wineserver 2>/dev/null || true; sleep 2
+sleep 2; kill_bottle_wineserver; sleep 2
 
 echo "Done. Restart the programs in \"$BOTTLE\"."
 echo "Check with:  C:\\wmiditest.exe            (lists the ports)"

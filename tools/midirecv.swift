@@ -70,6 +70,7 @@ var cur = Data()
 var inSysex = false
 let lock = NSLock()
 var lastByte = Date()
+var writePending = false
 
 func describe(_ m: Data) {
     let b = [UInt8](m)
@@ -103,7 +104,7 @@ MIDIInputPortCreateWithBlock(client, "in" as CFString, &port) { pl, _ in
                     buf.append(cur)
                     print("complete sysex: \(cur.count) bytes")
                     describe(cur)
-                    try? buf.write(to: URL(fileURLWithPath: outPath))
+                    writePending = true   // written outside the callback
                 }
             }
         }
@@ -121,6 +122,15 @@ var announced = true
 while true {
     Thread.sleep(forTimeInterval: 0.25)
     lock.lock()
+    // Writing the whole file inside the CoreMIDI callback is O(n^2) and blocks
+    // a real-time thread: it is done here instead.
+    if writePending {
+        let copy = buf
+        writePending = false
+        lock.unlock()
+        try? copy.write(to: URL(fileURLWithPath: outPath))
+        lock.lock()
+    }
     let idle = Date().timeIntervalSince(lastByte)
     if !buf.isEmpty && !inSysex && idle > quiet && !announced {
         announced = true

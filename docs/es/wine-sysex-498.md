@@ -92,11 +92,15 @@ Una **DLL proxy de `winmm`** que se pone delante de la de Wine: reenvía sus 186
 
 Detalles que costaron encontrar:
 
-1. **No se puede abrir un segundo handle al mismo dispositivo** — Wine devuelve `MMSYSERR_ALLOCATED`. Por eso el troceado **reutiliza la `MIDIHDR` de la propia aplicación**, guardando y restaurando `lpData`/`dwBufferLength` y limpiando `MHDR_DONE`/`MHDR_INQUEUE` entre trozos: así todo puntero que le vuelve es suyo y sigue siendo válido.
+1. **No se puede abrir un segundo handle al mismo dispositivo** — Wine devuelve `MMSYSERR_ALLOCATED`. Así que el diseño evidente —un handle privado sobre el que trocear, sin tocar el de la aplicación— no está disponible: los trozos tienen que salir por el handle de la aplicación.
 
-2. Para que no reciba un `MOM_DONE` por trozo, `midiOutOpen` **sustituye el callback** cuando es `CALLBACK_FUNCTION` y se traga los intermedios.
+2. **La cabecera de la aplicación no se toca.** Los trozos se envían con una `MIDIHDR` propia. Reutilizar la suya, mutándole `lpData` y `dwBufferLength`, es peligroso: Wine atiende `MOM_DONE` de forma síncrona dentro de la llamada, así que el aviso del último trozo le llegaría apuntando a mitad del bloque, y un manejador normal (`unprepare` y `free(lpData)`) liberaría un puntero 15 KB dentro de la reserva.
 
-3. **Wine emite `MOM_OPEN` durante la propia llamada a `midiOutOpen`.** Si la entrada de la tabla de handles se rellena *después* de abrir, ese callback se ejecuta con datos a medias, o con el puntero del handle anterior si al cerrar sólo se borró el handle. Hay que reservar y rellenar la entrada **entera antes** de abrir, y limpiarla entera al cerrar.
+3. Para que reciba **un solo** aviso de fin, `midiOutOpen` sustituye el callback cuando es `CALLBACK_FUNCTION`, se traga los de los trozos, y al terminar se emite uno con la cabecera intacta.
+
+   **Limitación conocida:** con `CALLBACK_WINDOW`, `CALLBACK_EVENT` o `CALLBACK_THREAD` no hay forma de filtrar los avisos del driver desde fuera, así que la aplicación recibe uno por trozo. Van con *nuestra* cabecera, no con la suya —memoria válida y ajena, en vez de la suya corrompida—, y al final se le entrega el suyo con `PostMessage`/`SetEvent`. Si una aplicación de este tipo se comporta raro con volcados grandes, es aquí donde hay que mirar.
+
+4. **Wine emite `MOM_OPEN` durante la propia llamada a `midiOutOpen`.** Si la entrada de la tabla de handles se rellena *después* de abrir, ese callback se ejecuta con datos a medias, o con el puntero del handle anterior si al cerrar sólo se borró el handle. Hay que reservar y rellenar la entrada **entera antes** de abrir, y limpiarla entera al cerrar.
 
 ## El arreglo correcto
 

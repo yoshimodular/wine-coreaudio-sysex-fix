@@ -73,6 +73,9 @@ if listOnly {
 }
 if files.isEmpty { fail("Missing the .syx file. Try --help.") }
 if chunk < 1 || chunk > 65000 { fail("--chunk out of range (1-65000)") }
+// usleep(UInt32(negative)) does not fail: it traps and aborts the process
+if delay < 0 || delay > 60000 { fail("--delay out of range (0-60000 ms)") }
+if gap   < 0 || gap   > 60000 { fail("--gap out of range (0-60000 ms)") }
 
 // ---- split into SysEx messages -----------------------------------------
 struct Msg { let bytes: [UInt8]; let label: String }

@@ -31,7 +31,9 @@ int main(int argc, char **argv)
 
     const char *want = argv[1];
     unsigned len = (argc > 2) ? (unsigned)strtoul(argv[2], NULL, 10) : 15549;
-    if (len < 2) len = 2;
+    /* 5 header bytes plus the trailing F7 get written: below that the memset
+     * and the indices run outside the allocation */
+    if (len < 8) len = 8;
 
     int dev = -1;
     UINT n = midiOutGetNumDevs();
@@ -48,6 +50,7 @@ int main(int argc, char **argv)
     if (r != MMSYSERR_NOERROR) { printf("midiOutOpen failed: %u\n", r); return 1; }
 
     char *buf = malloc(len);
+    if (!buf) { printf("out of memory\n"); midiOutClose(h); return 1; }
     memset(buf, 0x00, len);
     buf[0] = (char)0xF0; buf[1] = 0x42; buf[2] = 0x30; buf[3] = 0x36; buf[4] = 0x4C;
     buf[len-1] = (char)0xF7;
