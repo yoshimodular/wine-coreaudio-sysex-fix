@@ -1,0 +1,24 @@
+# build output
+*.dll
+*.exe
+*.o
+*.obj
+
+# generated from the real winmm.dll by winmm-proxy/build.sh; specific to the
+# Wine/CrossOver build it was extracted from, so not committed
+winmm.def
+.exports.raw
+
+# capture files written by the measurement tools
+sniff.bin*
+capture.syx
+*.syx
+
+# compiled Swift tools, if built in place
+tools/sysexsend
+tools/midisniff
+tools/midirecv
+tools/midislow
+tools/midispeed
+
+.DS_Store
