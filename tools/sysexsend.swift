@@ -105,12 +105,17 @@ for f in files {
 }
 
 let total = msgs.reduce(0) { $0 + $1.bytes.count }
-let rate = Double(chunk) / (Double(delay) / 1000.0)
+// with delay 0 the division yields infinity and prints "throughput inf B/s"
+let rate = delay > 0 ? Double(chunk) / (Double(delay) / 1000.0) : Double.infinity
 let secs = Double(total) / rate + Double(msgs.count - 1) * Double(gap) / 1000.0
 
 print("\(msgs.count) message(s), \(total) bytes")
 for m in msgs { print(String(format: "  %-22@ %6d bytes", m.label as NSString, m.bytes.count)) }
-print(String(format: "throughput %.0f B/s (DIN limit 3125) -> %.0f s", rate, secs))
+if rate.isInfinite {
+    print("throughput: no pause between blocks (as fast as possible)")
+} else {
+    print(String(format: "throughput %.0f B/s (DIN limit 3125) -> %.0f s", rate, secs))
+}
 if rate > 3125 { print("  WARNING: above MIDI cable speed, the receiver may overrun") }
 if dryRun { exit(0) }
 

@@ -70,8 +70,12 @@ if target.isEmpty {
 }
 // Unvalidated: -b 0 is an infinite loop at 99% CPU, -b -1 aborts the process
 // when the range is built, and -r 0 leaves the pause at infinity.
-if chunk < 16 || chunk > 498 {
-    FileHandle.standardError.write("--chunk out of range (16-498)\n".data(using: .utf8)!); exit(1)
+// The minimum is 64 because with fragments of a dozen bytes CoreMIDI mangles
+// the message (see docs/coremidi-12001.md); 256 is the tested size. The
+// maximum is NOT Wine's 498 limit, which is irrelevant here: this talks to
+// CoreMIDI directly and 600-byte blocks are verified to work.
+if chunk < 64 || chunk > 32768 {
+    FileHandle.standardError.write("--chunk out of range (64-32768; 256 is the tested value)\n".data(using: .utf8)!); exit(1)
 }
 if rate < 1 || rate > 1_000_000 {
     FileHandle.standardError.write("--rate out of range (1-1000000 B/s)\n".data(using: .utf8)!); exit(1)

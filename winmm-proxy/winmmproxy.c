@@ -45,14 +45,34 @@ static char log_path[MAX_PATH];
 #define MAXH 32
 static struct {
     HMIDIOUT  h;
-    UINT      dev;
     DWORD_PTR cb;         /* the application's real callback */
     DWORD_PTR inst;       /* its instance data */
     DWORD     type;       /* CALLBACK_FUNCTION, _WINDOW, ... */
     MIDIHDR  *in_flight;  /* header of the chunk being sent right now */
     MIDIHDR **retired;    /* heap headers still waiting to be freed */
     unsigned  n_retired;
+    CRITICAL_SECTION send; /* serialises the sends of THIS handle */
 } handles[MAXH];
+
+/* At most this many retired headers per handle. Messages the driver posts
+ * take a while to be consumed, so they cannot be freed immediately; a ring of
+ * 16 keeps memory flat instead of growing one block per dump for the whole
+ * session. */
+#define MAX_RETIRED 16
+
+/* Clears the slot but leaves its critical section intact: a ZeroMemory over
+ * the whole struct would destroy the CRITICAL_SECTION initialised in DllMain
+ * and any later use would be undefined. Call with `cs` held. */
+static void clear_slot(int i)
+{
+    handles[i].h = NULL;
+    handles[i].cb = 0;
+    handles[i].inst = 0;
+    handles[i].type = 0;
+    handles[i].in_flight = NULL;
+    handles[i].retired = NULL;
+    handles[i].n_retired = 0;
+}
 
 typedef void (CALLBACK *MIDIOUTPROC)(HMIDIOUT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
 
@@ -161,7 +181,6 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT ph, UINT dev, DWORD_PTR cb,
         if (!handles[i].h) {
             slot = i;
             handles[i].h = RESERVED;
-            handles[i].dev = dev;
             handles[i].cb = cb;
             handles[i].inst = inst;
             handles[i].type = type;
@@ -186,7 +205,7 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT ph, UINT dev, DWORD_PTR cb,
         if (r == MMSYSERR_NOERROR && ph)
             handles[slot].h = *ph;
         else
-            ZeroMemory(&handles[slot], sizeof(handles[slot]));
+            clear_slot(slot);
         LeaveCriticalSection(&cs);
     }
     if (r == MMSYSERR_NOERROR && ph)
@@ -203,6 +222,15 @@ MMRESULT WINAPI midiOutClose(HMIDIOUT h)
     init();
     if (!p_close) return MMSYSERR_ERROR;
     MMRESULT r = p_close(h);
+
+    /* Wait for any in-flight send on THIS handle before freeing its headers:
+     * freeing them while still in use was a use-after-free, reproduced under
+     * AddressSanitizer. */
+    int s2 = slot_of(h);
+    if (s2 >= 0) {
+        EnterCriticalSection(&handles[s2].send);
+        LeaveCriticalSection(&handles[s2].send);
+    }
     /* the slot is cleared COMPLETELY: leaving the callback pointer alive would
      * make the next open that reused the slot jump into dead code */
     EnterCriticalSection(&cs);
@@ -211,7 +239,7 @@ MMRESULT WINAPI midiOutClose(HMIDIOUT h)
             for (unsigned k = 0; k < handles[i].n_retired; k++)
                 free(handles[i].retired[k]);
             free(handles[i].retired);
-            ZeroMemory(&handles[i], sizeof(handles[i]));
+            clear_slot(i);
             break;
         }
     LeaveCriticalSection(&cs);
@@ -283,6 +311,22 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
     DWORD type = handles[slot].type;
     LeaveCriticalSection(&cs);
 
+    /* One send at a time per handle. With two concurrent sends there was a
+     * single `in_flight` field, so the second overwrote the first and the
+     * loser's completions reached the application pointing into the middle of
+     * ITS buffer: the very corruption all of this exists to prevent. And
+     * midiOutClose could free the heap header while it was still in use. */
+    EnterCriticalSection(&handles[slot].send);
+
+    /* revalidate now that we hold it: the handle may have closed while we waited */
+    EnterCriticalSection(&cs);
+    int still_ours = (handles[slot].h == h);
+    LeaveCriticalSection(&cs);
+    if (!still_ours) {
+        LeaveCriticalSection(&handles[slot].send);
+        return p_long(h, hdr, size);
+    }
+
     /* With a function callback the notifications are filtered and serviced
      * inside the call, so the header can live on the stack. With a window, a
      * thread or an event the driver POSTS messages the application will read
@@ -295,16 +339,22 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
 
     if (deferred) {
         ch = (MIDIHDR *)calloc(1, sizeof(MIDIHDR));
-        if (!ch) return MMSYSERR_NOMEM;
+        if (!ch) { LeaveCriticalSection(&handles[slot].send); return MMSYSERR_NOMEM; }
+
         EnterCriticalSection(&cs);
-        MIDIHDR **nl = (MIDIHDR **)realloc(handles[slot].retired,
-                            (handles[slot].n_retired + 1) * sizeof(MIDIHDR *));
-        if (nl) {
-            handles[slot].retired = nl;
-            nl[handles[slot].n_retired++] = ch;
+        if (handles[slot].n_retired == MAX_RETIRED) {
+            free(handles[slot].retired[0]);            /* the oldest */
+            memmove(&handles[slot].retired[0], &handles[slot].retired[1],
+                    (MAX_RETIRED - 1) * sizeof(MIDIHDR *));
+            handles[slot].n_retired--;
         }
+        if (!handles[slot].retired)
+            handles[slot].retired = (MIDIHDR **)calloc(MAX_RETIRED, sizeof(MIDIHDR *));
+        int room = handles[slot].retired != NULL;
+        if (room) handles[slot].retired[handles[slot].n_retired++] = ch;
         LeaveCriticalSection(&cs);
-        if (!nl) { free(ch); return MMSYSERR_NOMEM; }
+
+        if (!room) { free(ch); LeaveCriticalSection(&handles[slot].send); return MMSYSERR_NOMEM; }
     }
 
     char  *data  = hdr->lpData;
@@ -348,6 +398,8 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
      * out. Marking MHDR_DONE and notifying after a failure, on top of
      * returning an error, makes an application clean up twice: in the error
      * branch and in the notification. */
+    LeaveCriticalSection(&handles[slot].send);
+
     if (r != MMSYSERR_NOERROR) return r;
 
     hdr->dwFlags &= ~MHDR_INQUEUE;
@@ -360,8 +412,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         InitializeCriticalSection(&cs);
+        for (int i = 0; i < MAXH; i++) InitializeCriticalSection(&handles[i].send);
         DisableThreadLibraryCalls(inst);
     } else if (reason == DLL_PROCESS_DETACH && !res) {
+        for (int i = 0; i < MAXH; i++) DeleteCriticalSection(&handles[i].send);
         DeleteCriticalSection(&cs);
     }
     return TRUE;

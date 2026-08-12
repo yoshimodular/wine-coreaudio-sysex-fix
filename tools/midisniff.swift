@@ -53,6 +53,18 @@ while let a = it.next() {
     case "-v", "--virtual": virtualName = it.next()
     case "-s", "--source":  sourceName = it.next()
     case "-o", "--out":     outPath = it.next() ?? outPath
+    case "-h", "--help":
+        print("""
+        usage: midisniff [-v NAME | -s NAME] [-o file]
+
+          -v, --virtual <n>  create a virtual destination with that name
+          -s, --source  <n>  attach to an existing source
+          -o, --out <file>   where to dump what is captured (def. sniff.bin)
+
+        Also writes <file>.txt with the summary: bytes, packets, complete and
+        truncated SysEx, and the largest. Ctrl-C to stop.
+        """)
+        exit(0)
     default: break
     }
 }

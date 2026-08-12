@@ -67,8 +67,8 @@ rm -f "$D/.exports.raw"
 
 echo "Compiling..."
 i686-w64-mingw32-gcc -O2 -shared -o "$D/winmm.dll" "$D/winmmproxy.c" "$D/winmm.def" \
-    -lkernel32 -static-libgcc -Wl,--enable-stdcall-fixup 2>/dev/null
-i686-w64-mingw32-gcc -O2 -o "$D/wmiditest.exe" "$D/wmiditest.c" -lwinmm 2>/dev/null
+    -lkernel32 -static-libgcc -Wl,--enable-stdcall-fixup
+i686-w64-mingw32-gcc -O2 -o "$D/wmiditest.exe" "$D/wmiditest.c" -lwinmm
 
 echo "Installing into \"$BOTTLE\"..."
 mkdir -p "$B/drive_c/windows/syswow64"
