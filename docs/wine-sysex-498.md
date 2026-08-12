@@ -104,46 +104,49 @@ the CoreAudio backend.
 
 ## The workaround in this repository
 
-A **`winmm` proxy DLL** that sits in front of Wine's: it forwards its 186
-exports untouched and only intercepts `midiOutOpen`, `midiOutClose` and
-`midiOutLongMsg`. Anything under 498 bytes passes through unmodified; anything
-longer is split into 400-byte chunks with a pause between them (≈2500 B/s,
-below the 3125 of the DIN cable, which incidentally also avoids overrunning the
-interface).
+A **`winmm.dll` proxy** in front of Wine's: it forwards all 186 exports untouched and intercepts only `midiOutOpen`, `midiOutClose` and `midiOutLongMsg`.
 
-Details that were hard to find:
+Anything at or below 498 bytes is passed straight through. Longer messages are split into 400-byte blocks with a 160 ms pause (~2500 B/s, below the 3125 B/s of the DIN cable, which also avoids overrunning the interface). Tunable with `WINMM_CHUNK`, `WINMM_DELAY` and `WINMM_LOG`.
 
-1. **You cannot open a second handle to the same device** — Wine returns
-   `MMSYSERR_ALLOCATED`. So the obvious design — a private handle to chunk on,
-   with the application's own handle left completely alone — is not available:
-   the chunks have to go out on the application's handle.
+### Internals
 
-2. **The application's header is not touched.** The chunks are sent with a
-   `MIDIHDR` of our own, one per handle, reused and freed on close. Reusing the
-   application's, mutating its `lpData` and `dwBufferLength`, is dangerous: Wine
-   services `MOM_DONE` synchronously inside the call, so the notification of the
-   last chunk would reach it with the header pointing into the middle of the
-   block, and an ordinary handler (`unprepare` and `free(lpData)`) would free a
-   pointer 15 KB into the allocation.
+**The application's `MIDIHDR` is never touched.** Chunks are sent with a separate header, allocated **per send**:
 
-3. So that it receives **a single** completion notification, `midiOutOpen`
-   substitutes the callback when it is `CALLBACK_FUNCTION`, swallows the ones
-   belonging to the chunks, and when the send finishes one is emitted with the
-   application's header intact.
+| Callback type | Where the chunk header lives |
+|---|---|
+| `CALLBACK_FUNCTION`, `CALLBACK_NULL` | on the stack — completions are filtered and serviced synchronously inside the call |
+| `CALLBACK_WINDOW`, `_THREAD`, `_EVENT` | on the heap — the driver *posts* messages the app reads later, so it must outlive the call |
 
-   **Known limitation:** with `CALLBACK_WINDOW`, `CALLBACK_EVENT` or
-   `CALLBACK_THREAD` there is no way to filter the driver's notifications from
-   outside, so the application receives one per chunk. Those carry *our* header,
-   not its own — valid memory belonging to someone else, rather than its own in
-   a corrupted state — and at the end its own is delivered to it with
-   `PostMessage` / `PostThreadMessage` / `SetEvent`. If an application of that
-   kind misbehaves with large dumps, this is where to look.
+Heap headers go into a **ring bounded at 16 per handle**, freed on close. They cannot be freed earlier: a queued message may still point at them.
 
-4. **Wine fires `MOM_OPEN` during the `midiOutOpen` call itself.** If the
-   handle-table entry is filled in *after* opening, that callback runs with
-   half-written data, or with the pointer of the previous handle if closing only
-   cleared the handle field. The entry must be reserved and filled in
-   **entirely before** opening, and cleared entirely on close.
+**Sends on one handle are serialized** by a per-handle critical section, and `midiOutClose` waits for an in-flight send before freeing anything.
+
+**Completions are filtered by pointer:** `midiOutOpen` substitutes the callback for `CALLBACK_FUNCTION`, and only the `MOM_DONE` whose header is exactly the in-flight chunk is swallowed — so a short message sent meanwhile keeps its own completion. One completion is emitted at the end with the application's header intact, and **only if the send succeeded**.
+
+### Known limitation — and it is not harmless
+
+With `CALLBACK_WINDOW`, `CALLBACK_EVENT` or `CALLBACK_THREAD` there is no way to filter the driver's notifications from outside, so the application receives one per chunk. They carry *our* header rather than its own, but that **does not make it safe**: that header's `lpData` points into the middle of the application's buffer, so the ordinary handler (`unprepare(); free(hdr->lpData);`) would free an interior pointer just the same.
+
+**With those callback types the proxy is not safe for large dumps.** They are still sent, because without it nothing goes out at all — but if your application uses a window callback and cleans up on completion, do not use this yet.
+
+### Four things that were hard to find
+
+1. **You cannot open a second handle to the same device.** Wine returns `MMSYSERR_ALLOCATED`, so the obvious idea — sending the chunks on a private handle — is not available.
+2. **Wine services `MOM_DONE` synchronously inside `midiOutLongMsg`.** That is why mutating the application's header was memory corruption: the final chunk's completion reached it pointing into the middle of the buffer.
+3. **Wine fires `MOM_OPEN` during the `midiOutOpen` call itself.** The handle-table slot must be claimed and filled **entirely before** opening, and cleared entirely on close.
+4. **One in-flight marker per handle is not enough.** With two concurrent sends the second overwrites the first, and the loser's completions reach the application pointing into the middle of its buffer. Hence the serialization.
+
+### Verification status
+
+Measured end to end, from inside the bottle to a capture port: **498, 499, 15,549 and 18,749 bytes each arrive as a single SysEx of exactly the right size**.
+
+What is **not** verified, stated plainly:
+
+- The `CALLBACK_WINDOW`/`_THREAD`/`_EVENT` path has not been exercised with a real application, only reasoned about. See the limitation above.
+- Multi-threaded sending is addressed by design (serialization), not demonstrated by a test.
+- The Swift tools and shell scripts compile and pass `sh -n`, but the systematic review of that part is incomplete.
+
+This code has been through four adversarial review rounds, finding 11, 2, 9 and 13 defects. Several rounds introduced new defects while fixing old ones, almost all in the concurrency handling. Treat it accordingly.
 
 ## The correct fix
 

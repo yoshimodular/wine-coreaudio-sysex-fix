@@ -1,7 +1,5 @@
 # Wine descarta en silencio todo sysex de más de 498 bytes
 
-> Documento original en castellano. Versión en inglés: [../wine-sysex-498.md](../wine-sysex-498.md)
-
 **Afecta a:** cualquier aplicación de Windows que envíe System Exclusive a un puerto MIDI real bajo Wine o CrossOver **en macOS**. En Linux no ocurre.
 
 **Estado aguas arriba:** sin arreglar, desde 2015.
@@ -88,19 +86,49 @@ El driver de ALSA (`dlls/winealsa.drv/alsamidi.c`) entrega el búfer entero al s
 
 ## La solución de este repositorio
 
-Una **DLL proxy de `winmm`** que se pone delante de la de Wine: reenvía sus 186 exports intactos y sólo intercepta `midiOutOpen`, `midiOutClose` y `midiOutLongMsg`. Lo que baja de 498 bytes pasa sin tocarlo; lo más largo se trocea en bloques de 400 con pausa entre ellos (≈2500 B/s, por debajo de los 3125 del cable DIN, lo que de paso evita desbordar la interfaz).
+Una **DLL proxy de `winmm`** delante de la de Wine: reenvía sus 186 exports intactos e intercepta sólo `midiOutOpen`, `midiOutClose` y `midiOutLongMsg`.
 
-Detalles que costaron encontrar:
+Lo que baja de 498 bytes pasa sin tocarlo. Lo más largo se trocea en bloques de 400 con 160 ms de pausa (≈2500 B/s, por debajo de los 3125 del cable DIN, lo que de paso evita desbordar la interfaz). Ajustable con `WINMM_CHUNK`, `WINMM_DELAY` y `WINMM_LOG`.
 
-1. **No se puede abrir un segundo handle al mismo dispositivo** — Wine devuelve `MMSYSERR_ALLOCATED`. Así que el diseño evidente —un handle privado sobre el que trocear, sin tocar el de la aplicación— no está disponible: los trozos tienen que salir por el handle de la aplicación.
+### Cómo funciona por dentro
 
-2. **La cabecera de la aplicación no se toca.** Los trozos se envían con una `MIDIHDR` propia. Reutilizar la suya, mutándole `lpData` y `dwBufferLength`, es peligroso: Wine atiende `MOM_DONE` de forma síncrona dentro de la llamada, así que el aviso del último trozo le llegaría apuntando a mitad del bloque, y un manejador normal (`unprepare` y `free(lpData)`) liberaría un puntero 15 KB dentro de la reserva.
+**La cabecera de la aplicación no se toca nunca.** Los trozos se envían con otra:
 
-3. Para que reciba **un solo** aviso de fin, `midiOutOpen` sustituye el callback cuando es `CALLBACK_FUNCTION`, se traga los de los trozos, y al terminar se emite uno con la cabecera intacta.
+| Tipo de callback | Dónde vive la cabecera de troceo |
+|---|---|
+| `CALLBACK_FUNCTION`, `CALLBACK_NULL` | en la pila — los avisos se filtran y se atienden dentro de la propia llamada |
+| `CALLBACK_WINDOW`, `_THREAD`, `_EVENT` | en el montón — el driver *publica* mensajes que la aplicación lee después, así que tiene que sobrevivir a la llamada |
 
-   **Limitación conocida:** con `CALLBACK_WINDOW`, `CALLBACK_EVENT` o `CALLBACK_THREAD` no hay forma de filtrar los avisos del driver desde fuera, así que la aplicación recibe uno por trozo. Van con *nuestra* cabecera, no con la suya —memoria válida y ajena, en vez de la suya corrompida—, y al final se le entrega el suyo con `PostMessage`/`SetEvent`. Si una aplicación de este tipo se comporta raro con volcados grandes, es aquí donde hay que mirar.
+Las del montón van a un **anillo acotado a 16 por handle**, liberado al cerrar. No se pueden liberar antes porque puede quedar un mensaje encolado apuntando a ellas.
 
-4. **Wine emite `MOM_OPEN` durante la propia llamada a `midiOutOpen`.** Si la entrada de la tabla de handles se rellena *después* de abrir, ese callback se ejecuta con datos a medias, o con el puntero del handle anterior si al cerrar sólo se borró el handle. Hay que reservar y rellenar la entrada **entera antes** de abrir, y limpiarla entera al cerrar.
+**Los envíos de un handle están serializados** por una sección crítica propia. `midiOutClose` espera a que termine el envío en curso antes de liberar nada.
+
+**Los avisos se filtran por puntero:** `midiOutOpen` sustituye el callback cuando es `CALLBACK_FUNCTION`, y sólo se traga el `MOM_DONE` cuya cabecera es exactamente la del trozo en vuelo. Al terminar se emite un único aviso con la cabecera de la aplicación intacta, y **sólo si el envío tuvo éxito**.
+
+### Limitación conocida, y no es inofensiva
+
+Con `CALLBACK_WINDOW`, `CALLBACK_EVENT` o `CALLBACK_THREAD` no hay forma de filtrar los avisos del driver desde fuera: la aplicación recibe uno por trozo. Llevan *nuestra* cabecera en vez de la suya, pero eso **no la pone a salvo** — su `lpData` apunta a mitad del búfer de la aplicación, así que el manejador corriente (`unprepare` y `free(lpData)`) liberaría un puntero interior igualmente.
+
+**Con esos tipos de callback el proxy no es seguro para volcados largos.** Se envían igual porque sin él no sale nada, pero si tu aplicación usa callback de ventana y hace limpieza en el aviso de fin, no uses esto todavía.
+
+### Cuatro cosas que costaron encontrar
+
+1. **No se puede abrir un segundo handle al mismo dispositivo.** Wine devuelve `MMSYSERR_ALLOCATED`, así que la idea evidente —mandar los trozos por un handle privado— no es viable.
+2. **Wine atiende `MOM_DONE` de forma síncrona dentro de `midiOutLongMsg`.** Por eso mutar la cabecera de la aplicación era corrupción de memoria: el aviso del último trozo le llegaba apuntando a mitad del bloque.
+3. **Wine emite `MOM_OPEN` durante la propia llamada a `midiOutOpen`.** La entrada de la tabla de handles hay que reservarla y rellenarla **entera antes** de abrir, y limpiarla entera al cerrar.
+4. **Un solo indicador de seguimiento por handle no basta.** Con dos envíos simultáneos el segundo pisa al primero y los avisos del perdedor llegan a la aplicación apuntando a mitad de su búfer. De ahí la serialización.
+
+### Estado de la verificación
+
+Medido de extremo a extremo, desde dentro de la botella hacia un puerto de captura: **498, 499, 15.549 y 18.749 bytes llegan como un único sysex del tamaño exacto**.
+
+Lo que **no** está verificado, dicho para que nadie se confíe:
+
+- El camino de `CALLBACK_WINDOW`/`_THREAD`/`_EVENT` no se ha probado con una aplicación real, sólo razonado. Ver la limitación de arriba.
+- El comportamiento con varios hilos enviando a la vez está resuelto por diseño (serialización), no demostrado con una prueba.
+- Las herramientas Swift y los scripts han pasado compilación y `sh -n`, pero la revisión sistemática de esa parte quedó incompleta.
+
+El código ha pasado cuatro rondas de revisión adversaria, con 11, 2, 9 y 13 defectos encontrados. Varias rondas introdujeron defectos nuevos al arreglar los anteriores, casi todos en la parte de concurrencia. Trátalo en consecuencia.
 
 ## El arreglo correcto
 
