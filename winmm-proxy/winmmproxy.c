@@ -49,8 +49,9 @@ static struct {
     DWORD_PTR cb;         /* the application's real callback */
     DWORD_PTR inst;       /* its instance data */
     DWORD     type;       /* CALLBACK_FUNCTION, _WINDOW, ... */
-    int       suppress;   /* swallow the notifications of the chunks */
-    MIDIHDR  *chunk_hdr;  /* our own header, the one the chunks are sent with */
+    MIDIHDR  *in_flight;  /* header of the chunk being sent right now */
+    MIDIHDR **retired;    /* heap headers still waiting to be freed */
+    unsigned  n_retired;
 } handles[MAXH];
 
 typedef void (CALLBACK *MIDIOUTPROC)(HMIDIOUT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
@@ -85,12 +86,18 @@ static void CALLBACK proxy_cb(HMIDIOUT h, UINT msg, DWORD_PTR inst,
 
     EnterCriticalSection(&cs);
     HMIDIOUT alive = handles[i].h;
-    int swallow = handles[i].suppress;
+    MIDIHDR *ours = handles[i].in_flight;
     DWORD_PTR cb = handles[i].cb, app_inst = handles[i].inst;
     LeaveCriticalSection(&cs);
 
-    if (!alive) return;                        /* slot released: touch nothing */
-    if (msg == MOM_DONE && swallow) return;    /* notification of a chunk of ours */
+    if (!alive) return;                  /* slot released: touch nothing */
+
+    /* Swallows ONLY the notification of our own chunk headers. Filtering with
+     * a global flag held for the whole send also ate the legitimate MOM_DONE
+     * of any short message another thread sent meanwhile, and a dump takes
+     * some fifteen seconds. */
+    if (msg == MOM_DONE && ours && (MIDIHDR *)p1 == ours) return;
+
     if (cb) ((MIDIOUTPROC)cb)(h, msg, app_inst, p1, p2);
 }
 
@@ -158,7 +165,7 @@ MMRESULT WINAPI midiOutOpen(LPHMIDIOUT ph, UINT dev, DWORD_PTR cb,
             handles[i].cb = cb;
             handles[i].inst = inst;
             handles[i].type = type;
-            handles[i].suppress = 0;
+            handles[i].in_flight = NULL;
             break;
         }
     LeaveCriticalSection(&cs);
@@ -201,7 +208,9 @@ MMRESULT WINAPI midiOutClose(HMIDIOUT h)
     EnterCriticalSection(&cs);
     for (int i = 0; i < MAXH; i++)
         if (handles[i].h == h) {
-            free(handles[i].chunk_hdr);
+            for (unsigned k = 0; k < handles[i].n_retired; k++)
+                free(handles[i].retired[k]);
+            free(handles[i].retired);
             ZeroMemory(&handles[i], sizeof(handles[i]));
             break;
         }
@@ -216,9 +225,10 @@ static void notify_done(int slot, HMIDIOUT h, LPMIDIHDR hdr)
 {
     if (slot < 0) return;
     EnterCriticalSection(&cs);
+    /* revalidate: meanwhile the handle may have been closed and the slot reused */
+    if (handles[slot].h != h) { LeaveCriticalSection(&cs); return; }
     DWORD_PTR cb = handles[slot].cb, inst = handles[slot].inst;
     DWORD type = handles[slot].type;
-    UINT dev = handles[slot].dev;
     LeaveCriticalSection(&cs);
     if (!cb) return;
 
@@ -227,10 +237,10 @@ static void notify_done(int slot, HMIDIOUT h, LPMIDIHDR hdr)
         ((MIDIOUTPROC)cb)(h, MOM_DONE, inst, (DWORD_PTR)hdr, 0);
         break;
     case CALLBACK_WINDOW:
-        PostMessageA((HWND)cb, MM_MOM_DONE, (WPARAM)dev, (LPARAM)hdr);
+        PostMessageA((HWND)cb, MM_MOM_DONE, (WPARAM)h, (LPARAM)hdr);
         break;
     case CALLBACK_THREAD:
-        PostThreadMessageA((DWORD)cb, MM_MOM_DONE, (WPARAM)dev, (LPARAM)hdr);
+        PostThreadMessageA((DWORD)cb, MM_MOM_DONE, (WPARAM)h, (LPARAM)hdr);
         break;
     case CALLBACK_EVENT:
         SetEvent((HANDLE)cb);
@@ -254,29 +264,48 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
     dbg("[winmmproxy] long message: %lu bytes (Wine only accepts %d)",
         hdr->dwBufferLength, WINE_LIMIT);
 
-    /* The application's header is NOT touched. The chunks are sent with a
-     * header of our own, one per handle, reused and freed on close.
+    /* The application's header is NOT touched: the chunks go out with one of
+     * our own. Mutating theirs was heap corruption, because Wine services
+     * MOM_DONE synchronously inside p_long and the notification of the last
+     * chunk reached them pointing into the middle of the block.
      *
-     * It used to reuse the application's, mutating its lpData and
-     * dwBufferLength. Wine services MOM_DONE synchronously inside p_long, so
-     * the notification of the last chunk reached the application with the
-     * header pointing into the middle of the block: an ordinary handler
-     * ("unprepare and free(lpData)") freed a pointer 15 KB into the
-     * allocation. Heap corruption. */
+     * The header is PER SEND, not per handle: sharing a single one between
+     * threads made two concurrent sends overwrite each other's fields, and
+     * each one undo the other's prepare. */
     int slot = slot_of(h);
     if (slot < 0) {
         dbg("[winmmproxy] unknown handle: cannot chunk safely");
         return p_long(h, hdr, size);   /* better to fail like Wine than corrupt */
     }
+    if (!p_prep || !p_unprep) return p_long(h, hdr, size);
 
     EnterCriticalSection(&cs);
-    if (!handles[slot].chunk_hdr)
-        handles[slot].chunk_hdr = (MIDIHDR *)calloc(1, sizeof(MIDIHDR));
-    MIDIHDR *ch = handles[slot].chunk_hdr;
-    handles[slot].suppress = 1;           /* for the WHOLE send */
+    DWORD type = handles[slot].type;
     LeaveCriticalSection(&cs);
 
-    if (!ch) return MMSYSERR_NOMEM;
+    /* With a function callback the notifications are filtered and serviced
+     * inside the call, so the header can live on the stack. With a window, a
+     * thread or an event the driver POSTS messages the application will read
+     * later, so it has to survive: it goes on the heap and is freed when the
+     * handle is closed. */
+    int deferred = (type == CALLBACK_WINDOW || type == CALLBACK_THREAD ||
+                    type == CALLBACK_EVENT);
+    MIDIHDR stack_hdr;
+    MIDIHDR *ch = &stack_hdr;
+
+    if (deferred) {
+        ch = (MIDIHDR *)calloc(1, sizeof(MIDIHDR));
+        if (!ch) return MMSYSERR_NOMEM;
+        EnterCriticalSection(&cs);
+        MIDIHDR **nl = (MIDIHDR **)realloc(handles[slot].retired,
+                            (handles[slot].n_retired + 1) * sizeof(MIDIHDR *));
+        if (nl) {
+            handles[slot].retired = nl;
+            nl[handles[slot].n_retired++] = ch;
+        }
+        LeaveCriticalSection(&cs);
+        if (!nl) { free(ch); return MMSYSERR_NOMEM; }
+    }
 
     char  *data  = hdr->lpData;
     DWORD  total = hdr->dwBufferLength;
@@ -293,6 +322,10 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
         ch->dwBufferLength = n;
         ch->dwBytesRecorded = n;
 
+        EnterCriticalSection(&cs);
+        handles[slot].in_flight = ch;     /* so proxy_cb swallows ITS notification */
+        LeaveCriticalSection(&cs);
+
         if (p_prep(h, ch, sizeof(*ch)) != MMSYSERR_NOERROR) { r = MMSYSERR_ERROR; break; }
         r = p_long(h, ch, sizeof(*ch));
         p_unprep(h, ch, sizeof(*ch));
@@ -306,15 +339,21 @@ MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR hdr, UINT size)
     }
 
     EnterCriticalSection(&cs);
-    if (handles[slot].h == h) handles[slot].suppress = 0;
+    if (handles[slot].in_flight == ch) handles[slot].in_flight = NULL;
     LeaveCriticalSection(&cs);
+
+    dbg("[winmmproxy] sent %lu bytes in %u chunks -> %u", total, pieces, r);
+
+    /* Only counted as finished, and only notified, if everything really went
+     * out. Marking MHDR_DONE and notifying after a failure, on top of
+     * returning an error, makes an application clean up twice: in the error
+     * branch and in the notification. */
+    if (r != MMSYSERR_NOERROR) return r;
 
     hdr->dwFlags &= ~MHDR_INQUEUE;
     hdr->dwFlags |= MHDR_DONE;
     notify_done(slot, h, hdr);
-
-    dbg("[winmmproxy] sent %lu bytes in %u chunks -> %u", total, pieces, r);
-    return r;
+    return MMSYSERR_NOERROR;
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)

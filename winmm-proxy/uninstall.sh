@@ -11,6 +11,10 @@ kill_bottle_wineserver() {
     for w in $(pgrep -x wineserver 2>/dev/null); do
         lsof -p "$w" 2>/dev/null | grep -qF "Bottles/$BOTTLE/" && kill "$w" 2>/dev/null
     done
+    # The `return 0` keeps the function from returning 1 when the last
+    # wineserver examined is not this bottle's, which is the normal case.
+    # There is no `set -e` here (there is in build.sh, where that did abort the
+    # script), but a misleading exit status is no use to anyone.
     return 0
 }
 
